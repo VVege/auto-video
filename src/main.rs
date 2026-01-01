@@ -7,6 +7,7 @@ use anyhow::Context;
 use api::QwenClient;
 use clap::Parser;
 use error::Result;
+use scene::Scene;
 use tracing::{error, info};
 use video::VideoGenerator;
 
@@ -29,6 +30,10 @@ struct Args {
     /// Working directory for temporary files
     #[arg(short = 'w', long, default_value = "./output")]
     work_dir: String,
+
+    /// Skip image generation (use existing images)
+    #[arg(long)]
+    skip_images: bool,
 
     /// DashScope API key
     #[arg(long)]
@@ -81,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to create work directory")?;
 
     // 运行视频生成流程
-    if let Err(e) = run_generation(input_text, api_key, args.work_dir, args.output).await {
+    if let Err(e) = run_generation(input_text, api_key, args.work_dir, args.output, args.skip_images).await {
         error!("Video generation failed: {}", e);
         std::process::exit(1);
     }
@@ -95,31 +100,55 @@ async fn run_generation(
     api_key: String,
     work_dir: String,
     output_path: String,
+    skip_images: bool,
 ) -> Result<()> {
     // 1. 创建千问客户端
     let client = QwenClient::new(api_key);
 
-    // 2. 生成分镜
-    info!("Step 1/4: Generating scenes...");
-    let mut scenes = client.generate_scenes(&input_text).await?;
-    info!("Generated {} scenes", scenes.len());
-
-    // 3. 为每个分镜生成图片（支持断点续传）
-    info!("Step 2/4: Generating images for each scene...");
-    let scene_count = scenes.len();
-    for (idx, scene) in scenes.iter_mut().enumerate() {
-        let image_path = format!("{}/scene_{}.png", work_dir, scene.index);
+    // 2. 生成分镜或使用现有图片
+    let mut scenes = if skip_images {
+        info!("Skipping scene generation, using existing images...");
+        // 先生成分镜以获取字幕文本
+        info!("Generating scenes for subtitles...");
+        let mut scenes = client.generate_scenes(&input_text).await?;
+        info!("Generated {} scenes", scenes.len());
         
-        // 检查图片是否已存在，跳过已生成的
-        if tokio::fs::metadata(&image_path).await.is_ok() {
-            info!("Scene {} image already exists, skipping...", scene.index);
-            scene.image_path = Some(image_path);
-            continue;
+        // 使用现有图片
+        for scene in scenes.iter_mut() {
+            let image_path = format!("{}/scene_{}.png", work_dir, scene.index);
+            if tokio::fs::metadata(&image_path).await.is_ok() {
+                scene.image_path = Some(image_path);
+            }
         }
         
-        client.generate_image(&scene.description, &image_path).await?;
-        scene.image_path = Some(image_path.clone());
-        info!("Generated image for scene {} ({}/{})", scene.index, idx + 1, scene_count);
+        scenes
+    } else {
+        info!("Step 1/4: Generating scenes...");
+        let scenes = client.generate_scenes(&input_text).await?;
+        info!("Generated {} scenes", scenes.len());
+        scenes
+    };
+
+    // 3. 为每个分镜生成图片（支持断点续传）
+    if !skip_images {
+        info!("Step 2/4: Generating images for each scene...");
+        let scene_count = scenes.len();
+        for (idx, scene) in scenes.iter_mut().enumerate() {
+            let image_path = format!("{}/scene_{}.png", work_dir, scene.index);
+            
+            // 检查图片是否已存在，跳过已生成的
+            if tokio::fs::metadata(&image_path).await.is_ok() {
+                info!("Scene {} image already exists, skipping...", scene.index);
+                scene.image_path = Some(image_path);
+                continue;
+            }
+            
+            client.generate_image(&scene.description, &image_path).await?;
+            scene.image_path = Some(image_path.clone());
+            info!("Generated image for scene {} ({}/{})", scene.index, idx + 1, scene_count);
+        }
+    } else {
+        info!("Step 2/4: Skipped image generation");
     }
 
     // 4. 生成语音（支持断点续传）

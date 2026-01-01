@@ -1,5 +1,6 @@
 use crate::error::{Result, VideoError};
 use crate::scene::Scene;
+use std::path::PathBuf;
 use std::process::Command;
 use tracing::info;
 
@@ -41,7 +42,12 @@ impl VideoGenerator {
                 )
                 .await?;
 
-                concat_content.push_str(&format!("file '{}'\n", segment_path));
+                // 转换为绝对路径
+                let abs_segment_path = PathBuf::from(&segment_path)
+                    .canonicalize()
+                    .map_err(|e| VideoError::VideoGenerationError(format!("Failed to get absolute path: {}", e)))?;
+                
+                concat_content.push_str(&format!("file '{}'\n", abs_segment_path.display()));
                 segment_paths.push(segment_path);
             }
         }

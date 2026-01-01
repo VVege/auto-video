@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 const QWEN_TEXT_API: &str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation";
 const QWEN_IMAGE_API: &str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis";
-const QWEN_TTS_API: &str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2speech/speech-synthesis";
+const QWEN_TTS_API: &str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
 
 #[derive(Debug, Clone)]
 pub struct QwenClient {
@@ -66,7 +66,12 @@ struct TTSResponse {
 
 #[derive(Debug, Deserialize)]
 struct TTSOutput {
-    audio_url: Option<String>,
+    audio: AudioResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct AudioResult {
+    url: String,
 }
 
 impl QwenClient {
@@ -277,41 +282,146 @@ impl QwenClient {
 
     /// 生成语音
     pub async fn generate_speech(&self, text: &str, output_path: &str) -> Result<()> {
-        info!("Generating speech for text: {}", text);
+        info!("Generating speech for text (length: {} chars)...", text.len());
 
-        let request_body = json!({
-            "model": "cosyvoice-v1",
-            "input": {
-                "text": text
-            },
-            "parameters": {
-                "voice": "longxiaochun",
-                "format": "mp3"
-            }
-        });
-
-        let response = self
-            .client
-            .post(QWEN_TTS_API)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(VideoError::ApiError(format!(
-                "TTS API error: {}",
-                error_text
-            )));
+        // TTS API 限制：汉字按2个字符计算，最多600字符
+        // 保守起见，按最多250个汉字（500字符）来分段
+        const MAX_CHUNK_SIZE: usize = 250;
+        
+        let chars: Vec<char> = text.chars().collect();
+        let total_chars = chars.len();
+        
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        
+        while start < total_chars {
+            let end = std::cmp::min(start + MAX_CHUNK_SIZE, total_chars);
+            let chunk: String = chars[start..end].iter().collect();
+            chunks.push(chunk);
+            start = end;
         }
 
-        // 千问TTS API返回音频数据或URL
-        let audio_data = response.bytes().await?;
-        tokio::fs::write(output_path, audio_data).await?;
+        if chunks.len() > 1 {
+            info!("Text too long, splitting into {} chunks", chunks.len());
+            for (i, chunk) in chunks.iter().enumerate() {
+                info!("Chunk {} length: {} chars", i + 1, chunk.chars().count());
+            }
+        }
+
+        let mut audio_files = Vec::new();
+
+        // 为每个分段生成音频
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_file = if chunks.len() == 1 {
+                output_path.to_string()
+            } else {
+                format!("{}.part{}.mp3", output_path, i)
+            };
+
+            info!("Generating speech chunk {}/{} ({} chars)", i + 1, chunks.len(), chunk.chars().count());
+            
+            let request_body = json!({
+                "model": "qwen3-tts-flash",
+                "input": {
+                    "text": chunk
+                },
+                "parameters": {
+                    "voice": "Cherry",
+                    "format": "wav",       // API 实际返回 WAV
+                    "sample_rate": 24000
+                }
+            });
+
+            let response = self
+                .client
+                .post(QWEN_TTS_API)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
+                return Err(VideoError::ApiError(format!(
+                    "TTS API error (chunk {} length {}): {}",
+                    i + 1, chunk.chars().count(), error_text
+                )));
+            }
+
+            // 解析响应获取音频 URL
+            let response_json: serde_json::Value = response.json().await?;
+            
+            // qwen3-tts-flash 返回的结构是 output.audio.url
+            let audio_url = response_json["output"]["audio"]["url"]
+                .as_str()
+                .ok_or_else(|| VideoError::ApiError(format!(
+                    "No audio URL in response. Full response: {}", 
+                    serde_json::to_string(&response_json).unwrap_or_default()
+                )))?;
+
+            // 下载音频文件
+            info!("Downloading audio chunk from: {}", audio_url);
+            let audio_data = self.client.get(audio_url).send().await?.bytes().await?;
+            tokio::fs::write(&chunk_file, audio_data).await?;
+            
+            audio_files.push(chunk_file);
+        }
+
+        // 如果有多个分段，需要合并
+        if audio_files.len() > 1 {
+            info!("Merging {} audio chunks...", audio_files.len());
+            self.merge_audio_files(&audio_files, output_path).await?;
+            
+            // 删除临时文件
+            for file in audio_files {
+                tokio::fs::remove_file(file).await.ok();
+            }
+        }
 
         info!("Speech saved to: {}", output_path);
+        Ok(())
+    }
+
+    /// 合并多个音频文件
+    async fn merge_audio_files(&self, files: &[String], output: &str) -> Result<()> {
+        use std::process::Command;
+        use std::path::PathBuf;
+        
+        // 创建 FFmpeg concat 列表文件
+        let concat_list = format!("{}.concat.txt", output);
+        let mut content = String::new();
+        for file in files {
+            // 转换为绝对路径
+            let abs_path = PathBuf::from(file)
+                .canonicalize()
+                .map_err(|e| VideoError::ApiError(format!("Failed to get absolute path for {}: {}", file, e)))?;
+            content.push_str(&format!("file '{}'\n", abs_path.display()));
+        }
+        tokio::fs::write(&concat_list, content).await?;
+
+        // 使用 FFmpeg 合并音频，并转换为 MP3
+        let output_cmd = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", &concat_list,
+                "-c:a", "libmp3lame",  // 使用 MP3 编码器
+                "-b:a", "192k",        // 比特率
+                output,
+            ])
+            .output()
+            .map_err(|e| VideoError::ApiError(format!("Failed to merge audio: {}", e)))?;
+
+        if !output_cmd.status.success() {
+            let error = String::from_utf8_lossy(&output_cmd.stderr);
+            return Err(VideoError::ApiError(format!("FFmpeg merge failed: {}", error)));
+        }
+
+        // 删除临时列表文件
+        tokio::fs::remove_file(&concat_list).await.ok();
+        
         Ok(())
     }
 }
